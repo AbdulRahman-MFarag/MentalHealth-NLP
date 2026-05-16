@@ -1,9 +1,10 @@
 import streamlit as st
-import tensorflow as tf
+import torch
 import pickle
 import numpy as np
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 from groq import Groq
+from config import GROQ_API_KEY
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -19,26 +20,29 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_assets():
-    model = tf.keras.models.load_model('mental_health_model.keras')
-    with open('tokenizer.pkl', 'rb') as f:
-        tokenizer = pickle.load(f)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = DistilBertForSequenceClassification.from_pretrained('mental_health_model')
+    model.to(device)
+    model.eval()
+
+    tokenizer = DistilBertTokenizerFast.from_pretrained('bert_tokenizer')
+
     with open('label_encoder.pkl', 'rb') as f:
         le = pickle.load(f)
-    return model, tokenizer, le
 
-model, tokenizer, le = load_assets()
+    return model, tokenizer, le, device
+
+model, tokenizer, le, device = load_assets()
 
 # ─────────────────────────────────────────────
 # GROQ SETUP
 # ─────────────────────────────────────────────
-GROQ_API_KEY = "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"  # ← replace this
 client = Groq(api_key=GROQ_API_KEY)
 
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-MAXLEN = 256  # change to 100 if you used that in your notebook
-
 CLASS_META = {
     "Normal":               {"icon": "✅", "risk": "low"},
     "Anxiety":              {"icon": "😟", "risk": "medium"},
@@ -58,9 +62,20 @@ Keep responses to 3–4 short paragraphs."""
 # HELPERS
 # ─────────────────────────────────────────────
 def classify(text: str):
-    seq = tokenizer.texts_to_sequences([text])
-    padded = pad_sequences(seq, maxlen=MAXLEN)
-    probs = model.predict(padded, verbose=0)[0]
+
+    inputs = tokenizer(
+        text,
+        return_tensors='pt',
+        truncation=True,
+        padding=True,
+        max_length=256
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
     pred_idx = int(np.argmax(probs))
     label = le.classes_[pred_idx]
     confidence = float(probs[pred_idx])
@@ -90,7 +105,6 @@ def get_groq_response(messages: list) -> str:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Groq chat history (role/content pairs including system prompt)
 if "groq_history" not in st.session_state:
     st.session_state.groq_history = [
         {"role": "system", "content": SYSTEM_PROMPT}
@@ -111,8 +125,8 @@ with st.sidebar:
     st.divider()
     st.warning("⚠️ This is not a substitute for professional mental health care.")
     st.markdown("**If you are in crisis, please contact:**")
-    st.markdown("- 🆘 Emergency: 911 or local equivalent")
-    st.markdown("- 💬 Crisis Text Line: Text HOME to 741741")
+    st.markdown("- 🆘 Emergency: 122")
+    st.markdown("- 📞 hotline for psychological support and mental health assistance: 16328")
     st.markdown("- 🌍 International: findahelpline.com")
     st.divider()
     if st.button("🗑️ Clear conversation", use_container_width=True):
@@ -150,7 +164,6 @@ user_input = st.chat_input("How are you feeling right now?")
 
 if user_input and user_input.strip():
 
-    # Show user message
     with st.chat_message("user", avatar="🧑"):
         st.write(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -158,7 +171,6 @@ if user_input and user_input.strip():
     with st.chat_message("assistant", avatar="🌿"):
         with st.spinner("MindEase is thinking..."):
 
-            # First message: classify + build initial prompt
             if len(st.session_state.messages) == 1:
                 label, confidence = classify(user_input)
                 st.session_state.current_label = label
@@ -176,12 +188,10 @@ if user_input and user_input.strip():
                 user_prompt = build_initial_prompt(user_input, label)
 
             else:
-                # Continue naturally as a friend
                 label = ""
                 confidence = 0
                 user_prompt = user_input
 
-            # Add user message to Groq history and get response
             st.session_state.groq_history.append({"role": "user", "content": user_prompt})
 
             try:
